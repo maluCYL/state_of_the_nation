@@ -1,0 +1,16 @@
+## Environment variables
+
+.env
+__pycache__/
+*.pyc
+.vscode/
+.DS_Store
+node_modules/
+dist/
+build/
+
+## Files we don't want to track
+
+data/
+output/
+CREATING_DATASET.sql
