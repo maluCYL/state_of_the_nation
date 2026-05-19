@@ -1,27 +1,103 @@
 from pathlib import Path
+import os
 import textwrap
 import math
+from urllib.parse import quote_plus
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 from matplotlib.ticker import FuncFormatter
-from scipy.stats import theilslopes, norm
+from scipy.stats import norm
 
 
 # --- PATH SETUP ---
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
-CSV_FILE = DATA_DIR / "newstats.csv"
+ENV_FILE = BASE_DIR / ".env"
+DB_TABLE = "state_of_the_nation_update"
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# --- LOAD DATA ---
-def load_data(csv_path: Path = CSV_FILE) -> pd.DataFrame:
-    """Load the CSV file from the data folder."""
-    return pd.read_csv(csv_path, sep=";")
+# --- LOAD DATA FROM SQL DATABASE ---
+def _load_env_file(env_path: Path = ENV_FILE) -> None:
+    """Load simple KEY=VALUE pairs from .env without requiring python-dotenv."""
+    if not env_path.exists():
+        return
+
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+
+        os.environ.setdefault(key, value)
+
+
+def _database_url_from_env() -> str:
+    _load_env_file()
+
+    required_vars = ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_PORT", "DB_NAME"]
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+
+    if missing_vars:
+        raise RuntimeError(
+            "Missing database settings in .env: " + ", ".join(missing_vars)
+        )
+
+    user = quote_plus(os.environ["DB_USER"])
+    password = quote_plus(os.environ["DB_PASSWORD"])
+    host = os.environ["DB_HOST"]
+    port = os.environ["DB_PORT"]
+    database = os.environ["DB_NAME"]
+
+    return f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+
+
+def _validate_table_name(table_name: str) -> None:
+    parts = table_name.split(".")
+
+    if not all(part.replace("_", "").isalnum() for part in parts):
+        raise ValueError(f"Invalid SQL table name: {table_name}")
+
+
+def load_data(table_name: str | None = None) -> pd.DataFrame:
+    """Load State of the Nation data from the SQL database configured in .env."""
+    _load_env_file()
+    table_name = table_name or os.getenv("DB_TABLE", DB_TABLE)
+    _validate_table_name(table_name)
+
+    query = f"""
+        SELECT
+            t.indicator_id,
+            t.indicator_name,
+            t.value,
+            t.year,
+            t.geography_id,
+            t.source_id,
+            t.source_name
+        FROM {table_name} t
+    """
+
+    try:
+        from sqlalchemy import create_engine
+    except ImportError as exc:
+        raise ImportError(
+            "Loading data from SQL requires SQLAlchemy and PyMySQL. "
+            "Install them in this notebook environment with: "
+            "pip install sqlalchemy pymysql"
+        ) from exc
+
+    engine = create_engine(_database_url_from_env())
+
+    with engine.connect() as connection:
+        return pd.read_sql(query, connection)
 
 
 # --- LIST AVAILABLE INDICATORS ---
@@ -168,9 +244,8 @@ def add_smart_note(
         candidates = [c for c in candidates if c[:2] != (0.98, 0.95)]
 
     # Approximate box width/height in axes coordinates
-    # You can tweak these if your note is longer/shorter
     box_width = 0.34
-    box_height = 0.16
+    box_height = 0.10 + 0.045 * max(1, text.count("\n") + 1)
 
     def overlap_score(candidate):
         x0, y0, ha, va = candidate
@@ -232,9 +307,9 @@ def plot_indicator(
     Plot a line graph for a given indicator_id using year vs value.
 
     Analysis:
-    - average annual change
-    - Theil-Sen robust trend estimate: non-parametric estimator. 
-    - Mann-Kendall monotonic trend test: test for non-linear relationships. 
+    - total percentage change over the full period
+    - CAGR-style average annual percentage change
+    - latest annual percentage change
 
     value_type:
     - "count": values are numbers of CYP
@@ -293,9 +368,9 @@ def plot_indicator(
             f"No valid numeric values found for indicator_id='{indicator_id}'"
         )
 
-    if len(filtered) < 2:
+    if len(filtered) < 3:
         raise ValueError(
-            f"At least two valid observations are needed for trend analysis "
+            f"At least three valid observations are needed for summary calculations "
             f"for indicator_id='{indicator_id}'"
         )
 
@@ -306,12 +381,10 @@ def plot_indicator(
     if value_type == "proportion":
         filtered["display_value"] = filtered["value"] * 100
         y_label = "Percentage of Children and Young People (%)"
-        slope_unit = "percentage points"
         value_formatter = lambda x: f"{x:.1f}%"
     else:
         filtered["display_value"] = filtered["value"]
         y_label = "Number of Children and Young People (CYP)"
-        slope_unit = "CYP"
         value_formatter = lambda x: f"{x:,.0f}"
 
     # Create time variable
@@ -341,13 +414,11 @@ def plot_indicator(
     plot_title = title if title else f"{indicator_name} ({indicator_id})"
 
     # ------------------------------------------------------------------
-    # Trend calculations
+    # Summary calculations
     # ------------------------------------------------------------------
 
-    x = filtered["time"].astype(float)
-    y = filtered["display_value"].astype(float)
-
     start_row = filtered.iloc[0]
+    previous_row = filtered.iloc[-2]
     end_row = filtered.iloc[-1]
 
     start_time = float(start_row["time"])
@@ -357,46 +428,65 @@ def plot_indicator(
     end_year_label = end_row["year"]
 
     start_value = float(start_row["display_value"])
+    previous_value = float(previous_row["display_value"])
     end_value = float(end_row["display_value"])
 
     periods_elapsed = end_time - start_time
 
-    if periods_elapsed == 0:
-        average_annual_change = np.nan
-    else:
-        average_annual_change = (end_value - start_value) / periods_elapsed
-
     absolute_change = end_value - start_value
 
-    if start_value == 0:
-        percentage_change = np.nan
+    if value_type == "proportion":
+        total_percentage_change = absolute_change
     else:
-        percentage_change = (absolute_change / start_value) * 100
+        if start_value == 0:
+            total_percentage_change = np.nan
+        else:
+            total_percentage_change = (absolute_change / start_value) * 100
 
-    # Theil-Sen regression
-    theil_result = theilslopes(y, x, alpha=0.95)
+    if value_type == "proportion" and periods_elapsed > 0:
+        average_annual_change = absolute_change / periods_elapsed
+    elif periods_elapsed <= 0 or start_value <= 0 or end_value < 0:
+        average_annual_change = np.nan
+    else:
+        average_annual_change = (
+            ((end_value / start_value) ** (1 / periods_elapsed)) - 1
+        ) * 100
 
-    theil_slope = theil_result.slope
-    theil_intercept = theil_result.intercept
-    theil_low_slope = theil_result.low_slope
-    theil_high_slope = theil_result.high_slope
+    if value_type == "proportion":
+        last_year_percentage_change = end_value - previous_value
+    else:
+        if previous_value == 0:
+            last_year_percentage_change = np.nan
+        else:
+            last_year_percentage_change = (
+                (end_value - previous_value) / previous_value
+            ) * 100
 
-    filtered["theil_sen_fitted"] = theil_intercept + theil_slope * x
+    def percentage_formatter(value):
+        if np.isnan(value):
+            return "n/a"
+        return f"{value:+,.1f}%"
 
-    # Mann-Kendall trend test
-    mk_result = mann_kendall_test(y)
+    def change_formatter(value):
+        if np.isnan(value):
+            return "n/a"
+        if value_type == "proportion":
+            return f"{value:+,.1f} pp"
+        return f"{value:+,.1f}%"
 
-    mk_trend = mk_result["trend"]
-    mk_p_value = mk_result["p_value"]
-    mk_s = mk_result["s"]
-    mk_z = mk_result["z"]
+    def printed_change_formatter(value):
+        if np.isnan(value):
+            return "n/a"
+        if value_type == "proportion":
+            return f"{value:+,.1f} percentage points"
+        return value_formatter(value)
 
     # ------------------------------------------------------------------
-    # Print trend summary
+    # Print summary
     # ------------------------------------------------------------------
 
     print("\n" + "=" * 80)
-    print(f"Trend analysis for {indicator_id}: {indicator_name}")
+    print(f"Summary calculations for {indicator_id}: {indicator_name}")
     print("=" * 80)
 
     print(f"Period: {start_year_label} to {end_year_label}")
@@ -406,49 +496,40 @@ def plot_indicator(
     print("-" * 80)
     print(f"Start value: {value_formatter(start_value)}")
     print(f"End value: {value_formatter(end_value)}")
-    print(f"Absolute change: {value_formatter(absolute_change)}")
+    print(f"Absolute change: {printed_change_formatter(absolute_change)}")
 
-    if not np.isnan(percentage_change):
-        print(f"Percentage change: {percentage_change:,.1f}%")
+    if not np.isnan(total_percentage_change):
+        if value_type == "proportion":
+            print(
+                "Total percentage-point change: "
+                f"{total_percentage_change:+,.1f} percentage points"
+            )
+        else:
+            print(f"Total percentage change: {total_percentage_change:,.1f}%")
     else:
-        print("Percentage change: not available because start value is zero")
+        print("Total percentage change: not available because start value is zero")
 
     if not np.isnan(average_annual_change):
-        print(
-            f"Average annual change: "
-            f"{average_annual_change:,.2f} {slope_unit} per {time_label}"
-        )
+        if value_type == "proportion":
+            print(
+                "Average annual percentage-point change: "
+                f"{average_annual_change:+,.2f} percentage points per {time_label}"
+            )
+        else:
+            print(
+                f"Average annual change (CAGR-style): "
+                f"{average_annual_change:,.2f}% per {time_label}"
+            )
     else:
         print("Average annual change: not available")
 
-    print("\nTheil-Sen robust trend estimate")
+    print("\nLatest annual change")
     print("-" * 80)
+    print(f"Previous value: {value_formatter(previous_value)}")
     print(
-        f"Theil-Sen slope: "
-        f"{theil_slope:,.2f} {slope_unit} per {time_label}"
+        f"Latest annual {'percentage-point' if value_type == 'proportion' else 'percentage'} change: "
+        f"{change_formatter(last_year_percentage_change)}"
     )
-    print(
-        f"95% slope interval: "
-        f"{theil_low_slope:,.2f} to {theil_high_slope:,.2f} "
-        f"{slope_unit} per {time_label}"
-    )
-
-    print("\nMann-Kendall monotonic trend test")
-    print("-" * 80)
-    print(f"S statistic: {mk_s}")
-    print(f"Z statistic: {mk_z:,.3f}" if not np.isnan(mk_z) else "Z statistic: n/a")
-    print(
-        f"p-value: {mk_p_value:,.4f}"
-        if not np.isnan(mk_p_value)
-        else "p-value: n/a"
-    )
-    print(f"{mk_trend}")
-
-    if len(filtered) < 8:
-        print(
-            "\nNote: very small sample. Interpret statistical significance "
-            "cautiously."
-        )
 
     print("=" * 80 + "\n")
 
@@ -459,26 +540,17 @@ def plot_indicator(
     plt.rcParams["font.family"] = "Roboto Slab"
 
     fig, ax = plt.subplots(figsize=figsize)
+    plot_x = np.arange(len(filtered))
 
     # Plot observed line
     ax.plot(
-        filtered["year"],
+        plot_x,
         filtered["display_value"],
         color="#ff4d5e",
         linewidth=3.5,
         marker="o",
         markersize=9,
         label="Observed",
-    )
-
-    # Plot Theil-Sen fitted line
-    ax.plot(
-        filtered["year"],
-        filtered["theil_sen_fitted"],
-        color="#5a97bb",
-        linewidth=2.8,
-        linestyle=":",
-        label="Theil-Sen trend",
     )
 
     # Title and labels
@@ -500,33 +572,23 @@ def plot_indicator(
         FuncFormatter(lambda x, pos: value_formatter(x))
     )
 
-    # Rotate x labels
-    plt.xticks(rotation=45)
+    ax.set_xticks(plot_x)
+    ax.set_xticklabels(filtered["year"], rotation=45, ha="right")
 
-    # Stats annotation
-    if np.isnan(mk_p_value):
-        mk_text = "Mann-Kendall p = n/a"
-    else:
-        mk_text = f"Mann-Kendall p = {mk_p_value:.3f}"
-
-    annotation_text = (
-        f"Avg annual change = {average_annual_change:,.2f} "
-        f"{slope_unit} per {time_label}\n"
-        f"Theil-Sen trend = {theil_slope:,.2f} "
-        f"{slope_unit} per {time_label}\n"
-        f"{mk_text}\n"
-        f"{mk_trend}"
-    )
+    annotation_lines = [
+        f"Total change = {change_formatter(total_percentage_change)}",
+        f"Avg annual change = {change_formatter(average_annual_change)}",
+        f"Latest annual change = {change_formatter(last_year_percentage_change)}",
+    ]
+    annotation_text = "\n".join(annotation_lines)
 
     add_smart_note(
-    ax,
-    annotation_text,
-    filtered["display_value"],
-    fontsize=12,
-    avoid_top_right=True,
+        ax,
+        annotation_text,
+        filtered["display_value"],
+        fontsize=12,
+        avoid_top_right=True,
     )
-
-    ax.legend(frameon=False, fontsize=12)
 
     # Annotate every point
     for i, row in filtered.iterrows():
@@ -539,7 +601,7 @@ def plot_indicator(
 
         ax.annotate(
             value_formatter(row["display_value"]),
-            xy=(row["year"], row["display_value"]),
+            xy=(plot_x[i], row["display_value"]),
             xytext=xytext,
             textcoords="offset points",
             fontsize=12,
@@ -564,10 +626,16 @@ def plot_indicator(
         footer_lines.append("")
 
     footer_lines.append(f"Source: {source_name}")
-    footer_lines.append(
-        "Trend method: average annual change, Theil-Sen robust trend, "
-        "and Mann-Kendall monotonic trend test."
-    )
+    if value_type == "proportion":
+        footer_lines.append(
+            "Summary method: total percentage-point change, average annual "
+            "percentage-point change, and latest annual percentage-point change."
+        )
+    else:
+        footer_lines.append(
+            "Summary method: total percentage change, CAGR-style average annual "
+            "change, and latest annual percentage change."
+        )
 
     footer_text = "\n".join(footer_lines)
 
@@ -590,7 +658,7 @@ def plot_indicator(
         if not save_path.is_absolute():
             save_path = OUTPUT_DIR / save_path
 
-        plt.savefig(save_path, dpi=300, bbox_inches="tight", transparent=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight", transparent=False)
 
     plt.show()
 
@@ -774,3 +842,563 @@ def plot_indicator_dumbbell(
         plt.savefig(save_path, dpi=300, bbox_inches="tight", transparent=True)
 
     plt.show()
+
+
+# --- PLOT FUNCTION: HBAI METHODOLOGY CHANGE CHART ---
+
+def _add_hbai_smart_note(
+    ax,
+    text: str,
+    x_values,
+    y_values,
+    cutoff_x: float,
+    *,
+    fontsize: int = 9,
+) -> None:
+    """Place a note in the pre-change white area, avoiding plotted lines."""
+    x = np.asarray(x_values, dtype=float)
+    y = np.asarray(y_values, dtype=float)
+    points = np.column_stack([x, y])
+    points_axes = ax.transAxes.inverted().transform(ax.transData.transform(points))
+    cutoff_axes = ax.transAxes.inverted().transform(
+        ax.transData.transform([[cutoff_x, np.nanmedian(y)]])
+    )[0, 0]
+
+    line_count = text.count("\n") + 1
+    box_width = 0.23
+    box_height = 0.08 + (0.038 * line_count)
+
+    candidates = [
+        (0.02, 0.95, "left", "top"),
+        (0.37, 0.95, "left", "top"),
+        (0.02, 0.58, "left", "top"),
+        (0.37, 0.58, "left", "top"),
+        (0.46, 0.42, "left", "top"),
+        (0.50, 0.40, "left", "top"),
+        (0.54, 0.38, "left", "top"),
+        (0.02, 0.04, "left", "bottom"),
+        (0.37, 0.04, "left", "bottom"),
+        (0.50, 0.04, "left", "bottom"),
+    ]
+
+    def bounds(candidate):
+        x0, y0, ha, va = candidate
+        left = x0 if ha == "left" else x0 - box_width
+        right = x0 + box_width if ha == "left" else x0
+        bottom = y0 - box_height if va == "top" else y0
+        top = y0 if va == "top" else y0 + box_height
+        return left, right, bottom, top
+
+    def score(candidate):
+        left, right, bottom, top = bounds(candidate)
+        penalty = 0.0
+
+        if left < 0.01 or right > 0.99 or bottom < 0.04 or top > 0.98:
+            penalty += 1000
+
+        # Avoid the legend and keep the statistical note in the pre-change area.
+        if left < 0.36 and top > 0.70:
+            penalty += 400
+        if right > cutoff_axes - 0.03:
+            penalty += 1000
+        if left < 0.32 and bottom < 0.22:
+            penalty += 220
+
+        expanded_left = left - 0.035
+        expanded_right = right + 0.035
+        expanded_bottom = bottom - 0.035
+        expanded_top = top + 0.035
+
+        for px, py in points_axes:
+            inside = (
+                expanded_left <= px <= expanded_right
+                and expanded_bottom <= py <= expanded_top
+            )
+            if inside:
+                penalty += 90
+
+            dx = max(left - px, 0, px - right)
+            dy = max(bottom - py, 0, py - top)
+            penalty += 0.6 / (np.hypot(dx, dy) + 0.05)
+
+        return penalty
+
+    x0, y0, ha, va = min(candidates, key=score)
+
+    ax.text(
+        x0,
+        y0,
+        text,
+        transform=ax.transAxes,
+        ha=ha,
+        va=va,
+        fontsize=fontsize,
+        color="#444444",
+        bbox=dict(
+            boxstyle="round,pad=0.45",
+            facecolor="white",
+            edgecolor="none",
+            alpha=0.92,
+        ),
+    )
+
+
+def HBAI_graphs(
+    data: pd.DataFrame | Path | str | None = None,
+    *,
+    indicator_id: str = "CYPHPHARMPVT_2",
+    source_id: str | int | None = "HBAI2026",
+    dataset_id: str | int | None = None,
+    geography_id: str | int = "ENG",
+    pre_methodology_years: list[str] | None = None,
+    post_methodology_years: list[str] | None = None,
+    title: str = "Children in material deprivation and severe low income (England)",
+    y_label: str = "Number of Children and Young People (millions)",
+    source_name: str = "HBAI2026",
+    omitted_years: list[str] | None = None,
+    figsize: tuple = (10, 7),
+    save_path: Path | str | None = "HBAI20262_England_methodology_change.png",
+    show: bool = True,
+) -> dict:
+    """
+    Plot an HBAI time-series graph with a visible methodology-change break.
+
+    Summary calculations are made for the pre-methodology-change period only.
+    Pass either a dataframe or a CSV path as ``data``. If ``data`` is omitted,
+    the function uses ``data/HBAI20262_final.csv``.
+    """
+    pre_methodology_years = pre_methodology_years or [
+        "10/11-12/13",
+        "11/12-13/14",
+        "12/13-14/15",
+        "13/14-15/16",
+        "14/15-16/17",
+        "15/16-17/18",
+        "16/17-18/19",
+        "17/18-19/20",
+        "18/19-20/21",
+    ]
+    post_methodology_years = post_methodology_years or [
+        "20/21-22/23",
+        "22/23-24/25",
+    ]
+    omitted_years = omitted_years or ["19/20-21/22"]
+    plot_years = pre_methodology_years + post_methodology_years
+
+    if data is None:
+        data = BASE_DIR / "data" / "HBAI20262_final.csv"
+
+    if isinstance(data, pd.DataFrame):
+        hbai = data.copy()
+    else:
+        data_path = Path(data)
+        if not data_path.is_absolute() and not data_path.exists():
+            data_path = BASE_DIR / data_path
+        hbai = pd.read_csv(data_path)
+
+    filtered = hbai[
+        hbai["indicator_id"].astype(str).eq(str(indicator_id))
+        & hbai["geography_id"].astype(str).eq(str(geography_id))
+        & hbai["year"].astype(str).isin(plot_years)
+    ].copy()
+
+    if source_id is not None:
+        filtered = filtered[
+            filtered["source_id"].astype(str).eq(str(source_id))
+        ].copy()
+
+    if dataset_id is not None:
+        filtered = filtered[
+            filtered["dataset_id"].astype(str).eq(str(dataset_id))
+        ].copy()
+
+    filtered["year"] = filtered["year"].astype(str)
+    filtered["value"] = pd.to_numeric(filtered["value"], errors="coerce")
+    filtered = filtered.dropna(subset=["value"])
+    filtered["year"] = pd.Categorical(
+        filtered["year"],
+        plot_years,
+        ordered=True,
+    )
+    filtered = filtered.sort_values("year").reset_index(drop=True)
+    filtered["year"] = filtered["year"].astype(str)
+
+    missing_years = set(plot_years) - set(filtered["year"])
+    if missing_years:
+        raise ValueError(f"Missing expected HBAI years: {sorted(missing_years)}")
+
+    filtered["x"] = np.arange(len(filtered))
+    pre = filtered[filtered["year"].isin(pre_methodology_years)].copy()
+    post = filtered[filtered["year"].isin(post_methodology_years)].copy()
+
+    if len(pre) < 3:
+        raise ValueError("At least three pre-methodology observations are needed")
+
+    start_row = pre.iloc[0]
+    previous_row = pre.iloc[-2]
+    end_row = pre.iloc[-1]
+    periods_elapsed = end_row["x"] - start_row["x"]
+    absolute_change = end_row["value"] - start_row["value"]
+
+    if start_row["value"] == 0:
+        percentage_change = np.nan
+    else:
+        percentage_change = (absolute_change / start_row["value"]) * 100
+
+    if periods_elapsed <= 0 or start_row["value"] <= 0 or end_row["value"] < 0:
+        average_annual_change = np.nan
+    else:
+        average_annual_change = (
+            ((end_row["value"] / start_row["value"]) ** (1 / periods_elapsed)) - 1
+        ) * 100
+
+    if previous_row["value"] == 0:
+        last_year_percentage_change = np.nan
+    else:
+        last_year_percentage_change = (
+            (end_row["value"] - previous_row["value"]) / previous_row["value"]
+        ) * 100
+
+    def percentage_formatter(value):
+        if np.isnan(value):
+            return "n/a"
+        return f"{value:+.1f}%"
+
+    print("\n" + "=" * 80)
+    print(
+        f"Summary calculations for {indicator_id}: "
+        f"{geography_id}, previous methodology only"
+    )
+    print("=" * 80)
+    print(f"Period: {start_row['year']} to {end_row['year']}")
+    print(f"Observations: {len(pre)}")
+    print("\nStart-to-end change")
+    print("-" * 80)
+    print(f"Start value: {start_row['value']:.3f}m")
+    print(f"End value: {end_row['value']:.3f}m")
+    print(f"Absolute change: {absolute_change:.3f}m")
+    print(f"Total percentage change: {percentage_formatter(percentage_change)}")
+    print(
+        f"Average annual change (CAGR-style): "
+        f"{percentage_formatter(average_annual_change)} per period"
+    )
+    print("\nLatest annual change")
+    print("-" * 80)
+    print(f"Previous value: {previous_row['value']:.3f}m")
+    print(
+        f"Latest annual percentage change: "
+        f"{percentage_formatter(last_year_percentage_change)}"
+    )
+    print("=" * 80 + "\n")
+
+    plt.rcParams["font.family"] = "Roboto Slab"
+    fig, ax = plt.subplots(figsize=figsize)
+
+    cutoff_x = len(pre_methodology_years) - 0.5
+    ax.axvspan(cutoff_x, len(plot_years) - 0.5, color="#5a97bb", alpha=0.08, linewidth=0)
+    ax.axvline(cutoff_x, color="#444444", linewidth=1.8, linestyle="--")
+
+    ax.plot(
+        pre["x"],
+        pre["value"],
+        color="#ff4d5e",
+        linewidth=3.5,
+        marker="o",
+        markersize=9,
+        label="Observed, previous methodology",
+    )
+    ax.plot(
+        post["x"],
+        post["value"],
+        color="#ff4d5e",
+        linewidth=2.6,
+        linestyle="--",
+        marker="o",
+        markersize=9,
+        markerfacecolor="white",
+        markeredgewidth=2.4,
+        label="Observed, new methodology",
+    )
+
+    ax.text(
+        cutoff_x + 0.08,
+        ax.get_ylim()[1],
+        f"Methodology changed\nfrom {post_methodology_years[0]}",
+        ha="left",
+        va="top",
+        fontsize=11,
+        color="#444444",
+        bbox=dict(facecolor="white", edgecolor="none", alpha=0.9, pad=4),
+    )
+
+    stats_text = (
+        "Pre-change only\n"
+        f"Total change: {percentage_formatter(percentage_change)}\n"
+        f"Avg annual change: {percentage_formatter(average_annual_change)}\n"
+        f"Latest annual change: {percentage_formatter(last_year_percentage_change)}"
+    )
+
+    pre_sample_x = np.linspace(pre["x"].min(), pre["x"].max(), 80)
+    post_sample_x = np.linspace(post["x"].min(), post["x"].max(), 30)
+    note_x_values = np.r_[
+        filtered["x"],
+        pre_sample_x,
+        post_sample_x,
+    ]
+    note_y_values = np.r_[
+        filtered["value"],
+        np.interp(pre_sample_x, pre["x"], pre["value"]),
+        np.interp(post_sample_x, post["x"], post["value"]),
+    ]
+    _add_hbai_smart_note(
+        ax,
+        stats_text,
+        note_x_values,
+        note_y_values,
+        cutoff_x,
+        fontsize=9,
+    )
+
+    for _, row in filtered.iterrows():
+        ax.annotate(
+            f"{row['value']:.1f}m",
+            xy=(row["x"], row["value"]),
+            xytext=(0, 10),
+            textcoords="offset points",
+            fontsize=11,
+            fontweight="bold",
+            color="black",
+            ha="center",
+            va="bottom",
+            bbox=dict(
+                boxstyle="round,pad=0.25",
+                facecolor="white",
+                edgecolor="none",
+                alpha=0.9,
+            ),
+        )
+
+    ax.set_title(title, fontsize=22, pad=25)
+    ax.set_xlabel("Year", fontsize=12)
+    ax.set_ylabel(y_label, fontsize=12, labelpad=20)
+    ax.tick_params(axis="both", labelsize=14)
+    ax.set_xticks(filtered["x"])
+    ax.set_xticklabels(filtered["year"], rotation=45, ha="right")
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda value, pos: f"{value:.1f}m"))
+
+    ax.grid(False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(frameon=False, fontsize=11, loc="upper left")
+
+    omitted_text = ", ".join(omitted_years)
+    footer_text = (
+        f"Note: {omitted_text} is omitted because it is not available in the "
+        "source file. Values from "
+        f"{post_methodology_years[0]} onward are shown after the methodology "
+        "change and should not be treated as directly comparable with the "
+        "earlier trend.\n"
+        f"Source: {source_name}. Summary method: total percentage change, "
+        "CAGR-style average annual change, and latest annual percentage "
+        "change for the previous methodology period."
+    )
+    fig.text(
+        0.01,
+        0.02,
+        footer_text,
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        color="#444444",
+        linespacing=1.4,
+    )
+
+    plt.tight_layout(rect=[0, 0.12, 1, 1])
+
+    if save_path:
+        save_path = Path(save_path)
+        if not save_path.is_absolute():
+            save_path = OUTPUT_DIR / save_path
+        plt.savefig(save_path, dpi=300, bbox_inches="tight", transparent=False)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return {
+        "figure": fig,
+        "axis": ax,
+        "data": filtered,
+        "trend": {
+            "average_annual_change": average_annual_change,
+            "absolute_change": absolute_change,
+            "percentage_change": percentage_change,
+            "last_year_percentage_change": last_year_percentage_change,
+        },
+        "save_path": save_path,
+    }
+
+
+# --- PLOT FUNCTION: HOUSING COSTS COMPARISON CHART ---
+
+def housing_costs_graph(
+    data: pd.DataFrame | Path | str | None = None,
+    *,
+    sheet_name: str = "Sheet1",
+    with_children_col: str = "With Children\n0\nAll items",
+    without_children_col: str = "Without Children\n0\nAll items",
+    time_col: str = "time",
+    start_date: str = "2010-01-01",
+    end_date: str = "2025-12-31",
+    with_children_label: str = "Household costs index (With Children, All Items)",
+    without_children_label: str = "Household costs index (Without Children, All Items)",
+    title: str = "Household costs index by household type",
+    y_label: str = "Index",
+    source_name: str = "Housing costs data",
+    figsize: tuple = (10, 7),
+    save_path: Path | str | None = "HOUSINGCOSTS_children_comparison.png",
+    show: bool = True,
+) -> dict:
+    """
+    Plot housing costs indices for households with and without children.
+
+    The x-axis is monthly, but only December labels are shown to keep the
+    chart clean. Pass either a dataframe or an Excel path as ``data``. If
+    ``data`` is omitted, the function uses ``data/HOUSINGCOSTS_int.xlsx``.
+    """
+    if data is None:
+        data = BASE_DIR / "data" / "HOUSINGCOSTS_int.xlsx"
+
+    if isinstance(data, pd.DataFrame):
+        housing = data.copy()
+    else:
+        data_path = Path(data)
+        if not data_path.is_absolute() and not data_path.exists():
+            data_path = BASE_DIR / data_path
+        housing = pd.read_excel(data_path, sheet_name=sheet_name)
+
+    required_cols = [with_children_col, without_children_col, time_col]
+    missing_cols = [col for col in required_cols if col not in housing.columns]
+    if missing_cols:
+        raise ValueError(
+            "Missing expected columns in housing costs data: "
+            + ", ".join(repr(col) for col in missing_cols)
+        )
+
+    filtered = housing[required_cols].copy()
+    filtered["time_label"] = filtered[time_col].astype(str).str.strip()
+    filtered["time_clean"] = (
+        filtered["time_label"]
+        .str.replace(r"\s*\[p\]\s*$", "", regex=True)
+        .str.strip()
+    )
+    filtered["date"] = pd.to_datetime(
+        filtered["time_clean"],
+        format="%b-%Y",
+        errors="coerce",
+    )
+
+    filtered[with_children_col] = pd.to_numeric(
+        filtered[with_children_col],
+        errors="coerce",
+    )
+    filtered[without_children_col] = pd.to_numeric(
+        filtered[without_children_col],
+        errors="coerce",
+    )
+    filtered = filtered.dropna(
+        subset=["date", with_children_col, without_children_col]
+    )
+
+    start = pd.to_datetime(start_date)
+    end = pd.to_datetime(end_date)
+    filtered = filtered[
+        filtered["date"].between(start, end, inclusive="both")
+    ].sort_values("date")
+
+    if filtered.empty:
+        raise ValueError(
+            f"No valid housing costs observations found between "
+            f"{start_date} and {end_date}"
+        )
+
+    filtered = filtered.reset_index(drop=True)
+    filtered["x"] = np.arange(len(filtered))
+
+    december_ticks = filtered[filtered["date"].dt.month.eq(12)].copy()
+
+    plt.rcParams["font.family"] = "Roboto Slab"
+    fig, ax = plt.subplots(figsize=figsize)
+
+    ax.plot(
+        filtered["x"],
+        filtered[with_children_col],
+        color="#ff4d5e",
+        linewidth=3.2,
+        label=with_children_label,
+    )
+    ax.plot(
+        filtered["x"],
+        filtered[without_children_col],
+        color="#5a97bb",
+        linewidth=3.2,
+        label=without_children_label,
+    )
+
+    ax.set_title(title, fontsize=22, pad=25)
+    ax.set_xlabel("Year", fontsize=12)
+    ax.set_ylabel(y_label, fontsize=12, labelpad=20)
+    ax.tick_params(axis="both", labelsize=14)
+
+    ax.set_xticks(december_ticks["x"])
+    ax.set_xticklabels(
+        december_ticks["date"].dt.strftime("Dec-%Y"),
+        rotation=45,
+        ha="right",
+    )
+
+    ax.ticklabel_format(style="plain", axis="y")
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda value, pos: f"{value:,.0f}"))
+
+    ax.grid(False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(frameon=False, fontsize=11, loc="upper left")
+
+    footer_text = (
+        f"Source: {source_name}. Monthly values shown from "
+        f"{filtered['date'].min().strftime('%b-%Y')} to "
+        f"{filtered['date'].max().strftime('%b-%Y')}; x-axis labels show "
+        "December only."
+    )
+    fig.text(
+        0.01,
+        0.02,
+        footer_text,
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        color="#444444",
+        linespacing=1.4,
+    )
+
+    plt.tight_layout(rect=[0, 0.10, 1, 1])
+
+    if save_path:
+        save_path = Path(save_path)
+        if not save_path.is_absolute():
+            save_path = OUTPUT_DIR / save_path
+        plt.savefig(save_path, dpi=300, bbox_inches="tight", transparent=False)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return {
+        "figure": fig,
+        "axis": ax,
+        "data": filtered,
+        "save_path": save_path,
+    }

@@ -14,3 +14,5 @@ build/
 data/
 output/
 CREATING_DATASET.sql
+relqueries.sql
+test.ipynb
