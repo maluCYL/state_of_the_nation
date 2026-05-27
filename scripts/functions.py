@@ -109,6 +109,153 @@ def list_indicators(df: pd.DataFrame) -> pd.DataFrame:
         .reset_index(drop=True)
     )
 
+
+def _format_year_label(year) -> str:
+    """Format compact financial-year labels such as 202224 as 2022/24."""
+    year_label = str(year)
+
+    if year_label.isdigit() and len(year_label) == 6:
+        return f"{year_label[:4]}/{year_label[4:]}"
+
+    return year_label
+
+
+def _nice_axis_step(span: float) -> float:
+    """Return a clean tick-style step for rounding axis limits."""
+    if span <= 0 or np.isnan(span):
+        return 1
+
+    raw_step = span / 5
+    magnitude = 10 ** math.floor(math.log10(raw_step))
+    scaled_step = raw_step / magnitude
+
+    if scaled_step <= 1:
+        nice_step = 1
+    elif scaled_step <= 2:
+        nice_step = 2
+    elif scaled_step <= 5:
+        nice_step = 5
+    else:
+        nice_step = 10
+
+    return nice_step * magnitude
+
+
+def _round_axis_limits(
+    lower: float,
+    upper: float,
+    *,
+    min_limit: float | None = None,
+    max_limit: float | None = None,
+) -> tuple[float, float]:
+    """Round y-axis limits to clean values and keep optional hard bounds."""
+    if upper <= lower:
+        upper = lower + 1
+
+    step = _nice_axis_step(upper - lower)
+    rounded_lower = math.floor(lower / step) * step
+    rounded_upper = math.ceil(upper / step) * step
+
+    if min_limit is not None:
+        rounded_lower = max(min_limit, rounded_lower)
+
+    if max_limit is not None:
+        rounded_upper = min(max_limit, rounded_upper)
+
+    if rounded_upper <= rounded_lower:
+        rounded_upper = rounded_lower + step
+
+        if max_limit is not None and rounded_upper > max_limit:
+            rounded_upper = max_limit
+            rounded_lower = max(min_limit or 0, rounded_upper - step)
+
+    return rounded_lower, rounded_upper
+
+
+def _get_contextual_y_limits(
+    values,
+    value_type: str,
+    y_axis: str = "contextual",
+    y_limits: tuple[float, float] | None = None,
+) -> tuple[float, float] | None:
+    """
+    Decide suitable y-axis limits for an indicator chart.
+
+    The aim is to avoid overly zoomed-in y-axes that make small changes look
+    more volatile than they are, while still keeping the line readable.
+    """
+    values = pd.Series(values).dropna()
+
+    # Manual limits always take priority over automated scaling.
+    if y_limits is not None:
+        if len(y_limits) != 2 or y_limits[1] <= y_limits[0]:
+            raise ValueError("y_limits must be a tuple like (lower, upper)")
+
+        return y_limits
+
+    if values.empty:
+        return None
+
+    valid_y_axis_options = {"contextual", "zero", "auto"}
+    if y_axis not in valid_y_axis_options:
+        raise ValueError(
+            "y_axis must be one of: "
+            + ", ".join(sorted(valid_y_axis_options))
+        )
+
+    # "auto" keeps Matplotlib's default scaling.
+    if y_axis == "auto":
+        return None
+
+    min_value = values.min()
+    max_value = values.max()
+    observed_range = max_value - min_value
+
+    # "zero" is useful when the chart needs to emphasise absolute scale.
+    if y_axis == "zero":
+        upper = max_value * 1.10 if max_value > 0 else 1
+        return _round_axis_limits(0, upper, min_limit=0)
+
+    # Count indicators are scaled against their typical size.
+    # A movement of 1,000 is small around 30,000, but large around 2,000.
+    if value_type == "count":
+        typical_value = values.median()
+
+        # If the line is flat, still give it enough vertical space to read.
+        if observed_range == 0:
+            visible_range = max(abs(typical_value) * 0.25, 1)
+        else:
+            # Use whichever is larger:
+            # - the observed movement plus padding, so real change is visible
+            # - 25% of the typical value, so small change is not over-zoomed
+            visible_range = max(
+                observed_range * 1.5,
+                abs(typical_value) * 0.25,
+            )
+
+        center = (min_value + max_value) / 2
+        lower = center - visible_range / 2
+        upper = center + visible_range / 2
+
+        # Count data cannot go below zero.
+        if lower < 0:
+            upper = max(upper, visible_range)
+            lower = 0
+
+        return _round_axis_limits(lower, upper, min_limit=0)
+
+    # Proportion indicators are plotted as percentages, so use percentage
+    # points of padding and keep the scale within the natural 0%-100% bounds.
+    if value_type == "proportion":
+        padding = max(observed_range * 0.5, 2)
+        lower = max(0, min_value - padding)
+        upper = min(100, max_value + padding)
+
+        return _round_axis_limits(lower, upper, min_limit=0, max_limit=100)
+
+    return None
+
+
 ### DEFINING NON PARAMETRIC TESTS ####
 
 def mann_kendall_test(values: pd.Series, alpha: float = 0.05) -> dict:
@@ -293,7 +440,7 @@ def add_smart_note(
 # --- PLOT FUNCTION: LINE CHART ---
 
 def plot_indicator(
-    indicator_id: str,
+    indicator_id: str | None = None,
     source_id: str | int | None = None,
     year_filter: str | list[str] | None = None,
     df: pd.DataFrame | None = None,
@@ -302,9 +449,18 @@ def plot_indicator(
     figsize: tuple = (14, 8),
     save_path: Path | str | None = None,
     value_type: str = "count",  # "count" or "proportion"
+    y_label: str | None = None,
+    y_axis: str = "contextual",  # "contextual", "zero", or "auto"
+    y_limits: tuple[float, float] | None = None,
+    sum_indicator_ids: list[str] | tuple[str, ...] | None = None,
+    confirm_mixed_sources: bool = True,
 ) -> None:
     """
     Plot a line graph for a given indicator_id using year vs value.
+
+    If sum_indicator_ids is provided, values for those indicators are summed
+    by year before plotting. This summed mode only accepts count values and
+    requires a manual title.
 
     Analysis:
     - total percentage change over the full period
@@ -314,13 +470,59 @@ def plot_indicator(
     value_type:
     - "count": values are numbers of CYP
     - "proportion": values are proportions, e.g. 0.10 = 10%
+
+    y_label:
+    - optional manual y-axis label. If omitted, a default label is chosen
+      from value_type.
+
+    y_axis:
+    - "contextual": automatically widens the y-axis when values vary little
+      relative to their typical size
+    - "zero": starts the y-axis at zero
+    - "auto": leaves y-axis scaling to Matplotlib
+
+    y_limits:
+    - optional manual override, e.g. (25000, 35000)
     """
 
     if df is None:
         df = load_data()
 
     # Indicator filtering
-    filtered = df[df["indicator_id"] == indicator_id].copy()
+    sum_mode = sum_indicator_ids is not None
+
+    if sum_mode:
+        if value_type != "count":
+            raise ValueError(
+                "sum_indicator_ids can only be used with value_type='count'"
+            )
+
+        if not title:
+            raise ValueError(
+                "A manual title is required when using sum_indicator_ids"
+            )
+
+        if isinstance(sum_indicator_ids, str):
+            sum_indicator_ids = [sum_indicator_ids]
+
+        if len(sum_indicator_ids) < 2:
+            raise ValueError(
+                "sum_indicator_ids must contain at least two indicator ids"
+            )
+
+        sum_indicator_ids = [str(i) for i in sum_indicator_ids]
+        indicator_label = " + ".join(sum_indicator_ids)
+        filtered = df[
+            df["indicator_id"].astype(str).isin(sum_indicator_ids)
+        ].copy()
+    else:
+        if indicator_id is None:
+            raise ValueError(
+                "indicator_id is required unless sum_indicator_ids is provided"
+            )
+
+        indicator_label = str(indicator_id)
+        filtered = df[df["indicator_id"] == indicator_id].copy()
 
     # Source filtering
     if source_id is not None:
@@ -338,7 +540,10 @@ def plot_indicator(
         ].copy()
 
     # Empty check
-    filters = [f"indicator_id='{indicator_id}'"]
+    if sum_mode:
+        filters = [f"indicator_ids={sum_indicator_ids}"]
+    else:
+        filters = [f"indicator_id='{indicator_id}'"]
 
     if source_id is not None:
         filters.append(f"source_id='{source_id}'")
@@ -363,15 +568,79 @@ def plot_indicator(
 
     filtered = filtered.sort_values(["sort_year", "year"]).reset_index(drop=True)
 
+    if sum_mode:
+        found_indicator_ids = set(filtered["indicator_id"].astype(str).unique())
+        missing_indicator_ids = [
+            i for i in sum_indicator_ids if i not in found_indicator_ids
+        ]
+
+        if missing_indicator_ids:
+            raise ValueError(
+                "No valid numeric rows found for summed indicator ids: "
+                + ", ".join(missing_indicator_ids)
+            )
+
+        coverage = filtered.groupby("year")["indicator_id"].nunique()
+        incomplete_years = coverage[coverage < len(sum_indicator_ids)]
+
+        if not incomplete_years.empty:
+            raise ValueError(
+                "Cannot sum indicators because these years are missing at least "
+                "one requested indicator: "
+                + ", ".join(incomplete_years.index.astype(str))
+            )
+
+        source_summary = (
+            filtered[["indicator_id", "source_id", "source_name"]]
+            .drop_duplicates()
+            .sort_values(["indicator_id", "source_id"])
+        )
+        unique_sources = source_summary["source_id"].astype(str).nunique()
+
+        if unique_sources > 1 and confirm_mixed_sources:
+            print("\nWARNING: You are summing indicators from different sources.")
+            print("Please review the source mapping before continuing:\n")
+            print(source_summary.to_string(index=False))
+
+            response = input(
+                "\nContinue summing indicators from different sources? "
+                "Type 'yes' to continue: "
+            )
+
+            if response.strip().lower() != "yes":
+                raise ValueError(
+                    "Summed indicator plot cancelled because indicators come "
+                    "from different sources."
+                )
+
+        source_names = source_summary["source_name"].dropna().unique()
+        summed_source_name = (
+            source_names[0] if len(source_names) == 1 else "Multiple sources"
+        )
+
+        filtered = (
+            filtered
+            .groupby(["year", "sort_year"], dropna=False, as_index=False)
+            .agg(value=("value", "sum"))
+            .sort_values(["sort_year", "year"])
+            .reset_index(drop=True)
+        )
+
+        filtered["indicator_id"] = indicator_label
+        filtered["indicator_name"] = title
+        filtered["source_name"] = summed_source_name
+
+    filtered["year_label"] = filtered["year"].map(_format_year_label)
+
     if filtered.empty:
         raise ValueError(
-            f"No valid numeric values found for indicator_id='{indicator_id}'"
+            f"No valid numeric values found for indicator_id='{indicator_label}'"
         )
 
     if len(filtered) < 3:
         raise ValueError(
             f"At least three valid observations are needed for summary calculations "
-            f"for indicator_id='{indicator_id}'"
+            f"for indicator_id='{indicator_label}'"
         )
 
     # Value type handling
@@ -380,12 +649,23 @@ def plot_indicator(
 
     if value_type == "proportion":
         filtered["display_value"] = filtered["value"] * 100
-        y_label = "Percentage of Children and Young People (%)"
+        default_y_label = "Percentage of Children and Young People (%)"
         value_formatter = lambda x: f"{x:.1f}%"
     else:
         filtered["display_value"] = filtered["value"]
-        y_label = "Number of Children and Young People (CYP)"
+        default_y_label = "Number of Children and Young People (CYP)"
         value_formatter = lambda x: f"{x:,.0f}"
+
+    plot_y_label = y_label if y_label is not None else default_y_label
+
+    # Decide whether to apply custom y-axis limits.
+    # For proportions, this happens after conversion to percentages.
+    computed_y_limits = _get_contextual_y_limits(
+        filtered["display_value"],
+        value_type=value_type,
+        y_axis=y_axis,
+        y_limits=y_limits,
+    )
 
     # Create time variable
     # Uses actual year where available, otherwise falls back to sequence order
@@ -401,7 +681,7 @@ def plot_indicator(
         filtered["indicator_name"].dropna().iloc[0]
         if "indicator_name" in filtered.columns
         and not filtered["indicator_name"].dropna().empty
-        else indicator_id
+        else indicator_label
     )
 
     source_name = (
@@ -411,7 +691,7 @@ def plot_indicator(
         else "Source not available"
     )
 
-    plot_title = title if title else f"{indicator_name} ({indicator_id})"
+    plot_title = title if title else f"{indicator_name} ({indicator_label})"
 
     # ------------------------------------------------------------------
     # Summary calculations
@@ -424,8 +704,8 @@ def plot_indicator(
     start_time = float(start_row["time"])
     end_time = float(end_row["time"])
 
-    start_year_label = start_row["year"]
-    end_year_label = end_row["year"]
+    start_year_label = start_row["year_label"]
+    end_year_label = end_row["year_label"]
 
     start_value = float(start_row["display_value"])
     previous_value = float(previous_row["display_value"])
@@ -486,7 +766,7 @@ def plot_indicator(
     # ------------------------------------------------------------------
 
     print("\n" + "=" * 80)
-    print(f"Summary calculations for {indicator_id}: {indicator_name}")
+    print(f"Summary calculations for {indicator_label}: {indicator_name}")
     print("=" * 80)
 
     print(f"Period: {start_year_label} to {end_year_label}")
@@ -542,6 +822,11 @@ def plot_indicator(
     fig, ax = plt.subplots(figsize=figsize)
     plot_x = np.arange(len(filtered))
 
+    # Apply y-axis limits unless the helper returns None.
+    # None means "leave the axis to Matplotlib".
+    if computed_y_limits is not None:
+        ax.set_ylim(computed_y_limits)
+
     # Plot observed line
     ax.plot(
         plot_x,
@@ -556,7 +841,7 @@ def plot_indicator(
     # Title and labels
     ax.set_title(plot_title, fontsize=22, pad=25)
     ax.set_xlabel("Year", fontsize=12)
-    ax.set_ylabel(y_label, fontsize=12, labelpad=20)
+    ax.set_ylabel(plot_y_label, fontsize=12, labelpad=20)
     ax.tick_params(axis="both", labelsize=16)
 
     # Remove gridlines
@@ -573,7 +858,7 @@ def plot_indicator(
     )
 
     ax.set_xticks(plot_x)
-    ax.set_xticklabels(filtered["year"], rotation=45, ha="right")
+    ax.set_xticklabels(filtered["year_label"], rotation=45, ha="right")
 
     annotation_lines = [
         f"Total change = {change_formatter(total_percentage_change)}",
@@ -711,6 +996,7 @@ def plot_indicator_dumbbell(
     filtered["sort_year"] = filtered["year"].str.extract(r"(\d{4})")[0]
     filtered["sort_year"] = pd.to_numeric(filtered["sort_year"], errors="coerce")
     filtered = filtered.sort_values(["sort_year", "year"]).reset_index(drop=True)
+    filtered["year_label"] = filtered["year"].map(_format_year_label)
 
     if len(filtered) != 2:
         raise ValueError("Dumbbell chart works best with exactly 2 years/time periods.")
@@ -733,8 +1019,8 @@ def plot_indicator_dumbbell(
 
     fig, ax = plt.subplots(figsize=figsize)
 
-    year_1 = filtered["year"].iloc[0]
-    year_2 = filtered["year"].iloc[1]
+    year_1 = filtered["year_label"].iloc[0]
+    year_2 = filtered["year_label"].iloc[1]
     value_1 = filtered["value"].iloc[0]
     value_2 = filtered["value"].iloc[1]
 
@@ -853,7 +1139,7 @@ def _add_hbai_smart_note(
     y_values,
     cutoff_x: float,
     *,
-    fontsize: int = 9,
+    fontsize: int = 10,
 ) -> None:
     """Place a note in the pre-change white area, avoiding plotted lines."""
     x = np.asarray(x_values, dtype=float)
@@ -865,8 +1151,8 @@ def _add_hbai_smart_note(
     )[0, 0]
 
     line_count = text.count("\n") + 1
-    box_width = 0.23
-    box_height = 0.08 + (0.038 * line_count)
+    box_width = 0.40
+    box_height = 0.07 + (0.043 * line_count)
 
     candidates = [
         (0.02, 0.95, "left", "top"),
@@ -935,7 +1221,7 @@ def _add_hbai_smart_note(
         fontsize=fontsize,
         color="#444444",
         bbox=dict(
-            boxstyle="round,pad=0.45",
+            boxstyle="round,pad=0.55",
             facecolor="white",
             edgecolor="none",
             alpha=0.92,
@@ -963,7 +1249,9 @@ def HBAI_graphs(
     """
     Plot an HBAI time-series graph with a visible methodology-change break.
 
-    Summary calculations are made for the pre-methodology-change period only.
+    Total and average annual change are calculated for the
+    pre-methodology-change period. Latest annual change is calculated for the
+    post-methodology-change period.
     Pass either a dataframe or a CSV path as ``data``. If ``data`` is omitted,
     the function uses ``data/HBAI20262_final.csv``.
     """
@@ -1022,6 +1310,7 @@ def HBAI_graphs(
     )
     filtered = filtered.sort_values("year").reset_index(drop=True)
     filtered["year"] = filtered["year"].astype(str)
+    filtered["year_label"] = filtered["year"].map(_format_year_label)
 
     missing_years = set(plot_years) - set(filtered["year"])
     if missing_years:
@@ -1033,10 +1322,13 @@ def HBAI_graphs(
 
     if len(pre) < 3:
         raise ValueError("At least three pre-methodology observations are needed")
+    if len(post) < 2:
+        raise ValueError("At least two post-methodology observations are needed")
 
     start_row = pre.iloc[0]
-    previous_row = pre.iloc[-2]
     end_row = pre.iloc[-1]
+    post_previous_row = post.iloc[-2]
+    post_latest_row = post.iloc[-1]
     periods_elapsed = end_row["x"] - start_row["x"]
     absolute_change = end_row["value"] - start_row["value"]
 
@@ -1052,11 +1344,12 @@ def HBAI_graphs(
             ((end_row["value"] / start_row["value"]) ** (1 / periods_elapsed)) - 1
         ) * 100
 
-    if previous_row["value"] == 0:
-        last_year_percentage_change = np.nan
+    if post_previous_row["value"] == 0:
+        latest_annual_percentage_change = np.nan
     else:
-        last_year_percentage_change = (
-            (end_row["value"] - previous_row["value"]) / previous_row["value"]
+        latest_annual_percentage_change = (
+            (post_latest_row["value"] - post_previous_row["value"])
+            / post_previous_row["value"]
         ) * 100
 
     def percentage_formatter(value):
@@ -1067,13 +1360,13 @@ def HBAI_graphs(
     print("\n" + "=" * 80)
     print(
         f"Summary calculations for {indicator_id}: "
-        f"{geography_id}, previous methodology only"
+        f"{geography_id}, split by methodology period"
     )
     print("=" * 80)
-    print(f"Period: {start_row['year']} to {end_row['year']}")
-    print(f"Observations: {len(pre)}")
-    print("\nStart-to-end change")
+    print("\nBefore methodology change calculations")
     print("-" * 80)
+    print(f"Period: {start_row['year_label']} to {end_row['year_label']}")
+    print(f"Observations: {len(pre)}")
     print(f"Start value: {start_row['value']:.3f}m")
     print(f"End value: {end_row['value']:.3f}m")
     print(f"Absolute change: {absolute_change:.3f}m")
@@ -1082,12 +1375,18 @@ def HBAI_graphs(
         f"Average annual change (CAGR-style): "
         f"{percentage_formatter(average_annual_change)} per period"
     )
-    print("\nLatest annual change")
+    print("\nAfter methodology change calculations")
     print("-" * 80)
-    print(f"Previous value: {previous_row['value']:.3f}m")
+    print(
+        f"Period: {post_previous_row['year_label']} "
+        f"to {post_latest_row['year_label']}"
+    )
+    print(f"Observations: {len(post)}")
+    print(f"Previous value: {post_previous_row['value']:.3f}m")
+    print(f"Latest value: {post_latest_row['value']:.3f}m")
     print(
         f"Latest annual percentage change: "
-        f"{percentage_formatter(last_year_percentage_change)}"
+        f"{percentage_formatter(latest_annual_percentage_change)}"
     )
     print("=" * 80 + "\n")
 
@@ -1123,7 +1422,7 @@ def HBAI_graphs(
     ax.text(
         cutoff_x + 0.08,
         ax.get_ylim()[1],
-        f"Methodology changed\nfrom {post_methodology_years[0]}",
+        f"Methodology changed\nfrom {_format_year_label(post_methodology_years[0])}",
         ha="left",
         va="top",
         fontsize=11,
@@ -1132,10 +1431,14 @@ def HBAI_graphs(
     )
 
     stats_text = (
-        "Pre-change only\n"
-        f"Total change: {percentage_formatter(percentage_change)}\n"
-        f"Avg annual change: {percentage_formatter(average_annual_change)}\n"
-        f"Latest annual change: {percentage_formatter(last_year_percentage_change)}"
+        "Before methodology change calculations\n"
+        f"({start_row['year_label']} until {end_row['year_label']})\n"
+        f"- Total change: {percentage_formatter(percentage_change)}\n"
+        f"- Average Annual Change: {percentage_formatter(average_annual_change)}\n"
+        "After methodology change calculations\n"
+        f"({post_previous_row['year_label']} until {post_latest_row['year_label']})\n"
+        "- Latest annual change: "
+        f"{percentage_formatter(latest_annual_percentage_change)}"
     )
 
     pre_sample_x = np.linspace(pre["x"].min(), pre["x"].max(), 80)
@@ -1156,7 +1459,7 @@ def HBAI_graphs(
         note_x_values,
         note_y_values,
         cutoff_x,
-        fontsize=9,
+        fontsize=10,
     )
 
     for _, row in filtered.iterrows():
@@ -1183,7 +1486,7 @@ def HBAI_graphs(
     ax.set_ylabel(y_label, fontsize=12, labelpad=20)
     ax.tick_params(axis="both", labelsize=14)
     ax.set_xticks(filtered["x"])
-    ax.set_xticklabels(filtered["year"], rotation=45, ha="right")
+    ax.set_xticklabels(filtered["year_label"], rotation=45, ha="right")
     ax.yaxis.set_major_formatter(FuncFormatter(lambda value, pos: f"{value:.1f}m"))
 
     ax.grid(False)
@@ -1191,16 +1494,17 @@ def HBAI_graphs(
     ax.spines["right"].set_visible(False)
     ax.legend(frameon=False, fontsize=11, loc="upper left")
 
-    omitted_text = ", ".join(omitted_years)
+    omitted_text = ", ".join(_format_year_label(year) for year in omitted_years)
     footer_text = (
         f"Note: {omitted_text} is omitted because it is not available in the "
         "source file. Values from "
-        f"{post_methodology_years[0]} onward are shown after the methodology "
+        f"{_format_year_label(post_methodology_years[0])} onward are shown after the methodology "
         "change and should not be treated as directly comparable with the "
         "earlier trend.\n"
         f"Source: {source_name}. Summary method: total percentage change, "
-        "CAGR-style average annual change, and latest annual percentage "
-        "change for the previous methodology period."
+        "CAGR-style average annual change for the previous methodology "
+        "period, and latest annual percentage change for the new methodology "
+        "period."
     )
     fig.text(
         0.01,
@@ -1234,7 +1538,8 @@ def HBAI_graphs(
             "average_annual_change": average_annual_change,
             "absolute_change": absolute_change,
             "percentage_change": percentage_change,
-            "last_year_percentage_change": last_year_percentage_change,
+            "last_year_percentage_change": latest_annual_percentage_change,
+            "latest_annual_percentage_change": latest_annual_percentage_change,
         },
         "save_path": save_path,
     }
