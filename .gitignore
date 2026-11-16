@@ -1,18 +1,26 @@
-## Environment variables
-
+## Secrets
 .env
+
+## Python
+.venv/
 __pycache__/
 *.pyc
-.vscode/
+*.pyo
+
+## OS / editors
 .DS_Store
+.vscode/
+.idea/
+
+## Project data and generated artefacts
+data/
+output/
+SQL_scripts/
+
+## Excel temporary lock files
+~$*
+
+## Generic leftovers
 node_modules/
 dist/
 build/
-
-## Files we don't want to track
-
-data/
-output/
-CREATING_DATASET.sql
-relqueries.sql
-test.ipynb
